@@ -1051,18 +1051,21 @@ function renderPasswordChange() {
 function renderEmailSettings() {
   const email = state.session?.email || "";
   const verified = state.session?.email_verified || false;
-  const statusLabel = email
-    ? (verified ? " <span style='color:#2a9d2a'>(verified)</span>" : " <span style='color:#c07000'>(unverified — check your inbox)</span>")
+  const statusSuffix = email
+    ? (verified ? "" : " (unverified)")
     : "";
+  const emailDisplay = email ? `${email}${statusSuffix}` : "(none)";
+  // Form is hidden when email already set; revealed by clicking (edit)
+  const formHidden = email ? "display:none" : "";
   return `
     <section class="sidebar-section">
       <h2>Email Notifications</h2>
-      <p style="font-size:0.85em;color:#555;margin:0 0 8px">Receive an email when you are outbid. Your email must be verified before notifications are sent.</p>
-      <form id="emailSettingsForm" style="display: flex; gap: 8px; flex-direction: column;">
+      <p style="margin:0 0 8px">Email: <strong>${emailDisplay}</strong>${email ? ' <a href="#" id="editEmailBtn" style="font-size:0.85em">(edit)</a>' : ""}</p>
+      <form id="emailSettingsForm" style="display:flex;gap:8px;flex-direction:column;${formHidden}">
         <input type="email" name="email" placeholder="your@columbia.edu" value="${email}" />
-        <button type="submit">${email ? "Update Email" : "Set Email"}</button>
+        <button type="submit">Set Email</button>
+        ${email && !verified ? `<button type="button" id="resendVerifyBtn" style="background:none;border:none;padding:0;color:#0066cc;cursor:pointer;text-align:left;font-size:0.85em">Resend verification email</button>` : ""}
       </form>
-      ${email ? `<p style="font-size:0.8em;margin:4px 0 0">Current: <strong>${email}</strong>${statusLabel}</p>` : ""}
     </section>
   `;
 }
@@ -1292,7 +1295,13 @@ function bindInteractions() {
     }
   });
 
-  // Email settings
+  // Email settings — (edit) toggles form visibility
+  document.getElementById("editEmailBtn")?.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    const form = document.getElementById("emailSettingsForm");
+    if (form) form.style.display = form.style.display === "none" ? "flex" : "none";
+  });
+
   document.getElementById("emailSettingsForm")?.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const formData = new FormData(ev.target);
@@ -1303,10 +1312,21 @@ function bindInteractions() {
         body: JSON.stringify({ email }),
       });
       alert(resp.message || "Done.");
-      // Refresh session so email/verified status updates
       const sessionResp = await fetchJson("/api/session");
       if (sessionResp.authenticated) state.session = sessionResp.user;
       render();
+    } catch (err) {
+      alert(err.message);
+    }
+  });
+
+  document.getElementById("resendVerifyBtn")?.addEventListener("click", async () => {
+    try {
+      const resp = await fetchJson("/api/profile/email", {
+        method: "POST",
+        body: JSON.stringify({ email: state.session?.email || "" }),
+      });
+      alert(resp.message || "Verification email sent.");
     } catch (err) {
       alert(err.message);
     }
