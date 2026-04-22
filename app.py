@@ -56,6 +56,7 @@ SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)  # defaults to SMTP_USER
 SMTP_TIMEOUT = int(os.environ.get("SMTP_TIMEOUT", "10"))  # seconds
 APP_URL = os.environ.get("APP_URL", "").rstrip("/")  # e.g. https://casualai.net
+EMAIL_VERIFY_COOLDOWN_SECONDS = 60  # minimum gap between verification emails per user
 
 # ==============================================================================
 # GLOBAL STATE
@@ -932,6 +933,31 @@ def finalize_past_gpu_slots() -> int:
 # EMAIL NOTIFICATIONS
 # ==============================================================================
 
+def _maybe_send_verification(user: Dict[str, Any], email: str) -> Optional[str]:
+    """Generate a verification token and queue a verification email, respecting the cooldown.
+
+    Returns an error string if the cooldown has not elapsed, None on success.
+    Must be called under state_lock; spawns a daemon thread for the actual send.
+    """
+    last_sent = user.get("email_verification_sent_at")
+    if last_sent:
+        elapsed = (now_et() - datetime.fromisoformat(last_sent)).total_seconds()
+        if elapsed < EMAIL_VERIFY_COOLDOWN_SECONDS:
+            remaining = int(EMAIL_VERIFY_COOLDOWN_SECONDS - elapsed)
+            return f"Please wait {remaining}s before requesting another verification email."
+
+    token = secrets.token_urlsafe(32)
+    user["email_verification_token"] = token
+    user["email_verification_sent_at"] = now_et().isoformat()
+
+    threading.Thread(
+        target=send_verification_email,
+        args=(email, user["username"], token),
+        daemon=True,
+    ).start()
+    return None
+
+
 def _smtp_send(to_address: str, subject: str, body: str) -> None:
     """Low-level SMTP send. Raises on failure — callers handle exceptions."""
     msg = MIMEText(body, "plain", "utf-8")
@@ -1085,6 +1111,7 @@ def create_user_account(
         "email": "",
         "email_verified": False,
         "email_verification_token": "",
+        "email_verification_sent_at": None,
     }
 
     state["users"][username] = user
@@ -1693,36 +1720,20 @@ def update_user(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "enabled" in payload:
         user["enabled"] = bool(payload["enabled"])
 
-    send_verification = False
-    verification_token = ""
-    verification_email = ""
     if "email" in payload:
         email = str(payload.get("email") or "").strip()
-        # Strip control characters that could enable header injection
         email = "".join(c for c in email if c not in "\r\n")
         if email and "@" not in email:
             return {"error": "Invalid email address."}
         if email != user.get("email", ""):
-            # New address — reset verification and generate a fresh token
-            token = secrets.token_urlsafe(32)
             user["email"] = email
             user["email_verified"] = False
-            user["email_verification_token"] = token
+            user["email_verification_token"] = ""
+            user["email_verification_sent_at"] = None
             if email:
-                send_verification = True
-                verification_token = token
-                verification_email = email
+                _maybe_send_verification(user, email)
 
     save_state()
-
-    if send_verification:
-        # Send outside the state_lock context (caller releases lock after return)
-        threading.Thread(
-            target=send_verification_email,
-            args=(verification_email, username, verification_token),
-            daemon=True,
-        ).start()
-
     return {"ok": True, "user": user_summary(user)}
 
 
@@ -3105,23 +3116,32 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                 return
             username = current_user["username"]
             user = state["users"][username]
-            if email != user.get("email", ""):
-                token = secrets.token_urlsafe(32)
+            if not email:
+                user["email"] = ""
+                user["email_verified"] = False
+                user["email_verification_token"] = ""
+                user["email_verification_sent_at"] = None
+                save_state()
+                self.send_json({"ok": True, "message": "Email removed."})
+            elif email != user.get("email", ""):
                 user["email"] = email
                 user["email_verified"] = False
-                user["email_verification_token"] = token
+                user["email_verification_token"] = ""
+                user["email_verification_sent_at"] = None
+                err = _maybe_send_verification(user, email)
                 save_state()
-                if email:
-                    threading.Thread(
-                        target=send_verification_email,
-                        args=(email, username, token),
-                        daemon=True,
-                    ).start()
-                    self.send_json({"ok": True, "message": "Verification email sent. Check your inbox."})
+                if err:
+                    self.send_json({"error": err}, status=HTTPStatus.TOO_MANY_REQUESTS)
                 else:
-                    self.send_json({"ok": True, "message": "Email removed."})
+                    self.send_json({"ok": True, "message": "Verification email sent. Check your inbox."})
             else:
-                self.send_json({"ok": True, "message": "No change."})
+                # Same address — resend if cooldown elapsed
+                err = _maybe_send_verification(user, email)
+                if err:
+                    self.send_json({"error": err}, status=HTTPStatus.TOO_MANY_REQUESTS)
+                else:
+                    save_state()
+                    self.send_json({"ok": True, "message": "Verification email resent. Check your inbox."})
             return
 
         if route == "/api/admin/test-email":
