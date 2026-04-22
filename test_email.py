@@ -77,8 +77,10 @@ class TestSendOutbidEmail(unittest.TestCase):
         body = parsed.get_payload(decode=True).decode()
         self.assertIn("GPU 3", body)
         self.assertIn("GPU 7", body)
-        self.assertIn("Nov 15", body)  # friendly date format
-        self.assertIn("2:00 PM", body)
+        self.assertIn("Nov 15", body)
+        self.assertIn("2:00 PM", body)   # start of GPU 3 block
+        self.assertIn("3:00 PM", body)   # end of GPU 3 block (14:00 slot → 14:00–15:00)
+        self.assertIn("–", body)         # range separator present
 
     def test_smtp_error_does_not_raise(self):
         mock_smtp_instance = MagicMock()

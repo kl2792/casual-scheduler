@@ -991,18 +991,54 @@ def send_verification_email(to_address: str, username: str, code: str) -> None:
         print(f"EMAIL ERROR: failed to send verification email to {to_address}: {exc}")
 
 
-def _fmt_slot(slot_id: str) -> str:
-    """Format a slot ID like '2025-11-15|2025-11-15T14:00|3' into 'GPU 3 — Sat Nov 15, 2:00 PM'."""
-    parts = slot_id.split("|")
-    if len(parts) != 3:
-        return slot_id
-    _, slot_key, gpu_index = parts
-    try:
-        dt = datetime.strptime(slot_key, "%Y-%m-%dT%H:%M").replace(tzinfo=TZ)
-        friendly = dt.strftime("%a %b %-d, %-I:%M %p")
-    except ValueError:
-        friendly = slot_key
-    return f"GPU {gpu_index} — {friendly}"
+def _fmt_slot_blocks(slot_ids: List[str]) -> str:
+    """Group slot IDs into contiguous per-GPU blocks and format as readable ranges.
+
+    Input:  ['d|2025-11-15T14:00|3', 'd|2025-11-15T15:00|3', 'd|2025-11-15T09:00|7']
+    Output: '  GPU 3 — Sat Nov 15, 2:00 PM – 4:00 PM\n  GPU 7 — Sat Nov 15, 9:00 AM – 10:00 AM'
+
+    Consecutive hours on the same GPU are merged into a single range.
+    Non-consecutive hours appear as separate lines under the same GPU.
+    """
+    # Parse valid slot IDs
+    parsed: List[Tuple[int, datetime]] = []
+    fallback: List[str] = []
+    for sid in slot_ids:
+        parts = sid.split("|")
+        if len(parts) != 3:
+            fallback.append(f"  {sid}")
+            continue
+        _, slot_key, gpu_index = parts
+        try:
+            dt = datetime.strptime(slot_key, "%Y-%m-%dT%H:%M").replace(tzinfo=TZ)
+            parsed.append((int(gpu_index), dt))
+        except (ValueError, TypeError):
+            fallback.append(f"  {sid}")
+
+    # Sort by GPU then time
+    parsed.sort(key=lambda x: (x[0], x[1]))
+
+    # Merge consecutive hours per GPU into ranges
+    lines: List[str] = []
+    i = 0
+    while i < len(parsed):
+        gpu, start = parsed[i]
+        end = start
+        while i + 1 < len(parsed) and parsed[i + 1][0] == gpu and parsed[i + 1][1] == end + timedelta(hours=1):
+            i += 1
+            end = parsed[i][1]
+        range_end = end + timedelta(hours=1)  # exclusive end (e.g. 14:00 slot → ends 15:00)
+        if start.date() == range_end.date():
+            time_range = f"{start.strftime('%-I:%M %p')} – {range_end.strftime('%-I:%M %p')}"
+            lines.append(f"  GPU {gpu} — {start.strftime('%a %b %-d')}, {time_range}")
+        else:
+            # Rare cross-midnight block — show both dates
+            lines.append(
+                f"  GPU {gpu} — {start.strftime('%a %b %-d, %-I:%M %p')} – {range_end.strftime('%a %b %-d, %-I:%M %p')}"
+            )
+        i += 1
+
+    return "\n".join(lines + fallback)
 
 
 def send_outbid_email(to_address: str, username: str, slot_ids: List[str], close_time: Optional[datetime] = None) -> None:
@@ -1016,7 +1052,7 @@ def send_outbid_email(to_address: str, username: str, slot_ids: List[str], close
 
     n = len(slot_ids)
     slot_word = "slot" if n == 1 else "slots"
-    slot_lines = "\n".join(f"  {_fmt_slot(s)}" for s in slot_ids)
+    slot_lines = _fmt_slot_blocks(slot_ids)
 
     if close_time:
         deadline = close_time.strftime("%a %b %-d at %-I:%M %p ET")
