@@ -9,8 +9,10 @@ import hashlib
 import json
 import os
 import secrets
+import smtplib
 import threading
 from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -45,6 +47,13 @@ FINAL_DAY_STATUS = "final"
 CURRENT_WEEK_STATUS = CURRENT_DAY_STATUS
 NEXT_WEEK_STATUS = OPEN_DAY_STATUS
 FINAL_WEEK_STATUS = FINAL_DAY_STATUS
+
+# Email configuration (all optional; email is disabled if SMTP_HOST is unset)
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)  # defaults to SMTP_USER
 
 # ==============================================================================
 # GLOBAL STATE
@@ -918,6 +927,73 @@ def finalize_past_gpu_slots() -> int:
 
 
 # ==============================================================================
+# EMAIL NOTIFICATIONS
+# ==============================================================================
+
+def send_outbid_email(to_address: str, username: str, slot_ids: List[str]) -> None:
+    """Send an outbid notification email.
+
+    Called in a background thread so it never blocks bid responses.
+    Silently no-ops if SMTP_HOST is not configured.
+    """
+    if not SMTP_HOST or not to_address:
+        return
+
+    slot_lines = []
+    for slot_id in slot_ids:
+        parts = slot_id.split("|")
+        if len(parts) == 3:
+            week_key, slot_key, gpu_index = parts
+            slot_lines.append(f"  • GPU {gpu_index}  —  {slot_key}")
+        else:
+            slot_lines.append(f"  • {slot_id}")
+
+    slots_text = "\n".join(slot_lines)
+    body = (
+        f"Hi {username},\n\n"
+        f"You were outbid on the following GPU slot(s):\n\n"
+        f"{slots_text}\n\n"
+        f"Log in to place a new bid before the week closes.\n"
+    )
+
+    msg = MIMEText(body)
+    msg["Subject"] = f"GPU Scheduler: you've been outbid on {len(slot_ids)} slot(s)"
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_address
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            if SMTP_USER and SMTP_PASS:
+                smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.sendmail(SMTP_FROM, [to_address], msg.as_string())
+    except Exception as exc:
+        print(f"EMAIL ERROR: failed to send outbid email to {to_address}: {exc}")
+
+
+def _fire_outbid_emails(outbid_map: Dict[str, List[str]]) -> None:
+    """Send one email per affected user summarising all slots lost in one bid event.
+
+    outbid_map: {username: [slot_id, ...]}
+    Runs in a daemon thread — never blocks the request path.
+    """
+    def _send() -> None:
+        for username, slot_ids in outbid_map.items():
+            user = state.get("users", {}).get(username)
+            if not user:
+                continue
+            email = user.get("email", "")
+            if not email:
+                continue
+            send_outbid_email(email, username, slot_ids)
+
+    t = threading.Thread(target=_send, daemon=True)
+    t.start()
+
+
+# ==============================================================================
 # USER OPERATIONS
 # ==============================================================================
 
@@ -983,6 +1059,7 @@ def create_user_account(
         "last_refill_week": None,
         "enabled": True,
         "last_login": None,
+        "email": "",
     }
 
     state["users"][username] = user
@@ -1077,6 +1154,7 @@ def place_bid(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
 
             # Add outbid notification for all users who were outbid
             slot_id = f"{week_key}|{slot_key}|{gpu_index}"
+            email_map: Dict[str, List[str]] = {}
             for outbid_username in outbid_users:
                 outbid_user = state.get("users", {}).get(outbid_username)
                 if outbid_user:
@@ -1085,6 +1163,9 @@ def place_bid(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
                     if slot_id not in outbid_user["outbid_notification_queue"]:
                         outbid_user["outbid_notification_queue"].append(slot_id)
                         print(f"ADDED TO QUEUE: {slot_id} for user {outbid_username}")
+                    email_map.setdefault(outbid_username, []).append(slot_id)
+            if email_map:
+                _fire_outbid_emails(email_map)
 
             state["bid_log"].append(
                 {
@@ -1223,6 +1304,7 @@ def place_bulk_bids(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, 
             timestamp = now_et().isoformat()
             results = []
 
+            bulk_email_map: Dict[str, List[str]] = {}
             for v in validations:
                 entry = v["entry"]
 
@@ -1253,6 +1335,7 @@ def place_bulk_bids(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, 
                         if slot_id not in outbid_user["outbid_notification_queue"]:
                             outbid_user["outbid_notification_queue"].append(slot_id)
                             print(f"ADDED TO QUEUE: {slot_id} for user {outbid_username}")
+                        bulk_email_map.setdefault(outbid_username, []).append(slot_id)
 
                 state["bid_log"].append(
                     {
@@ -1277,6 +1360,8 @@ def place_bulk_bids(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, 
                 state["bid_log"] = state["bid_log"][-500:]
 
             save_state()
+            if bulk_email_map:
+                _fire_outbid_emails(bulk_email_map)
             return {"ok": True, "bids": results, "count": len(results)}
 
     finally:
@@ -1569,6 +1654,9 @@ def update_user(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "enabled" in payload:
         user["enabled"] = bool(payload["enabled"])
 
+    if "email" in payload:
+        user["email"] = str(payload.get("email") or "").strip()
+
     save_state()
     return {"ok": True, "user": user_summary(user)}
 
@@ -1616,6 +1704,10 @@ def create_user(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
     except (ValueError, TypeError) as exc:
         return {"error": str(exc)}
+
+    if "email" in payload:
+        user["email"] = str(payload.get("email") or "").strip()
+        save_state()
 
     return {"ok": True, "user": user_summary(user)}
 
