@@ -1053,7 +1053,7 @@ function renderEmailSettings() {
   const verified = state.session?.email_verified || false;
   const formHidden = email ? "display:none" : "";
   const meta = email
-    ? `<span style="font-size:0.85em;color:#777">${verified ? "" : "(unverified) "}<a href="#" id="editEmailBtn">(edit)</a></span>`
+    ? `<a href="#" id="editEmailBtn" style="font-size:0.85em;color:#777;text-decoration:none">${verified ? "(edit)" : "(unverified) (edit)"}</a>`
     : `<a href="#" id="editEmailBtn" style="font-size:0.85em">(edit)</a>`;
   return `
     <section class="sidebar-section">
