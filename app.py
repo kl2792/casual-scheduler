@@ -946,13 +946,13 @@ def _maybe_send_verification(user: Dict[str, Any], email: str) -> Optional[str]:
             remaining = int(EMAIL_VERIFY_COOLDOWN_SECONDS - elapsed)
             return f"Please wait {remaining}s before requesting another verification email."
 
-    token = secrets.token_urlsafe(32)
-    user["email_verification_token"] = token
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    user["email_verification_token"] = code
     user["email_verification_sent_at"] = now_et().isoformat()
 
     threading.Thread(
         target=send_verification_email,
-        args=(email, user["username"], token),
+        args=(email, user["username"], code),
         daemon=True,
     ).start()
     return None
@@ -973,19 +973,19 @@ def _smtp_send(to_address: str, subject: str, body: str) -> None:
         smtp.sendmail(SMTP_FROM, [to_address], msg.as_string())
 
 
-def send_verification_email(to_address: str, username: str, token: str) -> None:
-    """Send an email-verification link. No-ops if SMTP_HOST is not configured."""
+def send_verification_email(to_address: str, username: str, code: str) -> None:
+    """Send a 6-digit verification code. No-ops if SMTP_HOST is not configured."""
     if not SMTP_HOST or not to_address:
         return
-    verify_url = f"{APP_URL}/api/verify-email?token={token}" if APP_URL else f"/api/verify-email?token={token}"
     body = (
         f"Hi {username},\n\n"
-        f"Please verify your email address to receive GPU scheduler notifications:\n\n"
-        f"  {verify_url}\n\n"
+        f"Your GPU Scheduler verification code is:\n\n"
+        f"  {code}\n\n"
+        f"Enter it in the Email Notifications box to activate outbid alerts.\n"
         f"If you did not expect this, you can ignore it.\n"
     )
     try:
-        _smtp_send(to_address, "GPU Scheduler: verify your email address", body)
+        _smtp_send(to_address, "GPU Scheduler: your verification code", body)
     except Exception as exc:
         print(f"EMAIL ERROR: failed to send verification email to {to_address}: {exc}")
 
@@ -2829,21 +2829,6 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        if route == "/api/verify-email":
-            token = params.get("token", [""])[0]
-            if not token:
-                self.send_json({"error": "Missing token."}, status=HTTPStatus.BAD_REQUEST)
-                return
-            for user in state.get("users", {}).values():
-                if user.get("email_verification_token") == token and user.get("email"):
-                    user["email_verified"] = True
-                    user["email_verification_token"] = ""
-                    save_state()
-                    self.send_json({"ok": True, "message": "Email verified. You will receive outbid notifications."})
-                    return
-            self.send_json({"error": "Invalid or expired token."}, status=HTTPStatus.BAD_REQUEST)
-            return
-
         self.send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 
     def handle_api_post(self, payload: Dict[str, Any]) -> None:
@@ -3102,6 +3087,25 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             response = clear_week_bids(payload)
             status = HTTPStatus.OK if response.get("ok") else HTTPStatus.BAD_REQUEST
             self.send_json(response, status=status)
+            return
+
+        if route == "/api/verify-email":
+            if not current_user:
+                self.send_json({"error": "Authentication required."}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            code = str(payload.get("code") or "").strip()
+            if not code:
+                self.send_json({"error": "code required."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            user = state["users"][current_user["username"]]
+            stored = user.get("email_verification_token", "")
+            if not stored or code != stored:
+                self.send_json({"error": "Invalid code."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            user["email_verified"] = True
+            user["email_verification_token"] = ""
+            save_state()
+            self.send_json({"ok": True, "message": "Email verified. You'll receive outbid notifications."})
             return
 
         if route == "/api/profile/email":

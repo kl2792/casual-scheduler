@@ -1063,6 +1063,11 @@ function renderEmailSettings() {
         <input type="email" name="email" placeholder="your@columbia.edu" value="${email}" />
         <button type="submit">Set Email</button>
       </form>
+      ${email && !verified ? `
+      <form id="verifyCodeForm" style="display:flex;gap:8px;flex-direction:column;margin-top:8px">
+        <input type="text" name="code" placeholder="6-digit code" maxlength="6" inputmode="numeric" style="width:120px" />
+        <button type="submit">Verify</button>
+      </form>` : ""}
       <p id="emailStatusMsg" style="font-size:0.8em;color:#888;margin:4px 0 0;display:none"></p>
     </section>
   `;
@@ -1318,6 +1323,25 @@ function bindInteractions() {
       if (msg) { msg.textContent = resp.message || "Done."; msg.style.display = "block"; }
     } catch (err) {
       if (statusEl) { statusEl.textContent = err.message; statusEl.style.display = "block"; }
+    }
+  });
+
+  document.getElementById("verifyCodeForm")?.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const code = new FormData(ev.target).get("code").trim();
+    const msg = document.getElementById("emailStatusMsg");
+    try {
+      const resp = await fetchJson("/api/verify-email", {
+        method: "POST",
+        body: JSON.stringify({ code }),
+      });
+      const sessionResp = await fetchJson("/api/session");
+      if (sessionResp.authenticated) state.session = sessionResp.user;
+      render();
+      const m = document.getElementById("emailStatusMsg");
+      if (m) { m.textContent = resp.message; m.style.display = "block"; }
+    } catch (err) {
+      if (msg) { msg.textContent = err.message; msg.style.display = "block"; }
     }
   });
 
