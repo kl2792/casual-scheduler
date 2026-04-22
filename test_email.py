@@ -208,7 +208,9 @@ class TestEmailFieldOnUser(unittest.TestCase):
         with patch.object(self.app, "save_state"):
             result = self.app.update_user({"username": "alice", "email": "alice@columbia.edu"})
         self.assertEqual(result["ok"], True)
-        self.assertEqual(self.app.state["users"]["alice"]["email"], "alice@columbia.edu")
+        # email goes to email_pending until verified, not directly to email
+        self.assertEqual(self.app.state["users"]["alice"]["email_pending"], "alice@columbia.edu")
+        self.assertEqual(self.app.state["users"]["alice"].get("email", ""), "")
 
     def test_update_user_strips_whitespace(self):
         self.app.state["users"]["alice"] = {
@@ -217,7 +219,7 @@ class TestEmailFieldOnUser(unittest.TestCase):
         }
         with patch.object(self.app, "save_state"):
             self.app.update_user({"username": "alice", "email": "  alice@columbia.edu  "})
-        self.assertEqual(self.app.state["users"]["alice"]["email"], "alice@columbia.edu")
+        self.assertEqual(self.app.state["users"]["alice"]["email_pending"], "alice@columbia.edu")
 
 
 if __name__ == "__main__":
