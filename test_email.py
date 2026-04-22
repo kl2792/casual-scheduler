@@ -77,7 +77,8 @@ class TestSendOutbidEmail(unittest.TestCase):
         body = parsed.get_payload(decode=True).decode()
         self.assertIn("GPU 3", body)
         self.assertIn("GPU 7", body)
-        self.assertIn("2025-11-15T14:00", body)
+        self.assertIn("Nov 15", body)  # friendly date format
+        self.assertIn("2:00 PM", body)
 
     def test_smtp_error_does_not_raise(self):
         mock_smtp_instance = MagicMock()
@@ -117,7 +118,7 @@ class TestFireOutbidEmails(unittest.TestCase):
     def test_sends_one_email_per_user(self):
         sent = []
 
-        def fake_send(to, username, slot_ids):
+        def fake_send(to, username, slot_ids, close_time=None):
             sent.append((to, username, slot_ids))
 
         fake_state = {

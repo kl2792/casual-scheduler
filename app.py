@@ -991,7 +991,21 @@ def send_verification_email(to_address: str, username: str, code: str) -> None:
         print(f"EMAIL ERROR: failed to send verification email to {to_address}: {exc}")
 
 
-def send_outbid_email(to_address: str, username: str, slot_ids: List[str]) -> None:
+def _fmt_slot(slot_id: str) -> str:
+    """Format a slot ID like '2025-11-15|2025-11-15T14:00|3' into 'GPU 3 — Sat Nov 15, 2:00 PM'."""
+    parts = slot_id.split("|")
+    if len(parts) != 3:
+        return slot_id
+    _, slot_key, gpu_index = parts
+    try:
+        dt = datetime.strptime(slot_key, "%Y-%m-%dT%H:%M").replace(tzinfo=TZ)
+        friendly = dt.strftime("%a %b %-d, %-I:%M %p")
+    except ValueError:
+        friendly = slot_key
+    return f"GPU {gpu_index} — {friendly}"
+
+
+def send_outbid_email(to_address: str, username: str, slot_ids: List[str], close_time: Optional[datetime] = None) -> None:
     """Send an outbid notification email.
 
     Called in a background thread so it never blocks bid responses.
@@ -1000,31 +1014,33 @@ def send_outbid_email(to_address: str, username: str, slot_ids: List[str]) -> No
     if not SMTP_HOST or not to_address:
         return
 
-    slot_lines = []
-    for slot_id in slot_ids:
-        parts = slot_id.split("|")
-        if len(parts) == 3:
-            week_key, slot_key, gpu_index = parts
-            slot_lines.append(f"  - GPU {gpu_index}  {slot_key}")
-        else:
-            slot_lines.append(f"  - {slot_id}")
+    n = len(slot_ids)
+    slot_word = "slot" if n == 1 else "slots"
+    slot_lines = "\n".join(f"  {_fmt_slot(s)}" for s in slot_ids)
 
-    slots_text = "\n".join(slot_lines)
-    login_line = f"Log in at {APP_URL} to place a new bid before the week closes." if APP_URL else "Log in to place a new bid before the week closes."
+    if close_time:
+        deadline = close_time.strftime("%a %b %-d at %-I:%M %p ET")
+        urgency = f"Bidding closes {deadline}."
+    else:
+        urgency = "Bidding is still open."
+
+    login_line = f"Log in at {APP_URL} to rebid." if APP_URL else "Log in to rebid."
+
     body = (
         f"Hi {username},\n\n"
-        f"You were outbid on the following GPU slot(s):\n\n"
-        f"{slots_text}\n\n"
-        f"{login_line}\n"
+        f"You were outbid on {n} GPU {slot_word}:\n\n"
+        f"{slot_lines}\n\n"
+        f"{urgency} {login_line}\n"
     )
 
+    subject = f"GPU Scheduler: outbid on {n} {slot_word}"
     try:
-        _smtp_send(to_address, f"GPU Scheduler: you've been outbid on {len(slot_ids)} slot(s)", body)
+        _smtp_send(to_address, subject, body)
     except Exception as exc:
         print(f"EMAIL ERROR: failed to send outbid email to {to_address}: {exc}")
 
 
-def _fire_outbid_emails(email_map: Dict[str, Tuple[str, List[str]]]) -> None:
+def _fire_outbid_emails(email_map: Dict[str, Tuple[str, List[str]]], close_time: Optional[datetime] = None) -> None:
     """Send one email per affected user summarising all slots lost in one bid event.
 
     email_map: {username: (email_address, [slot_id, ...])}
@@ -1035,7 +1051,7 @@ def _fire_outbid_emails(email_map: Dict[str, Tuple[str, List[str]]]) -> None:
     def _send() -> None:
         for username, (email, slot_ids) in email_map.items():
             if email:
-                send_outbid_email(email, username, slot_ids)
+                send_outbid_email(email, username, slot_ids, close_time)
 
     t = threading.Thread(target=_send, daemon=True)
     t.start()
@@ -1244,7 +1260,9 @@ def place_bid(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
 
             save_state()
             if email_map:
-                _fire_outbid_emails(email_map)
+                open_days = find_days_by_status(OPEN_DAY_STATUS)
+                close_time = day_close_time(parse_day(open_days[0][0])) if open_days else None
+                _fire_outbid_emails(email_map, close_time)
             return {"ok": True, "price": new_price, "winner": user["username"]}
 
 
@@ -1431,7 +1449,9 @@ def place_bulk_bids(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, 
 
             save_state()
             if bulk_email_map:
-                _fire_outbid_emails(bulk_email_map)
+                open_days = find_days_by_status(OPEN_DAY_STATUS)
+                close_time = day_close_time(parse_day(open_days[0][0])) if open_days else None
+                _fire_outbid_emails(bulk_email_map, close_time)
             return {"ok": True, "bids": results, "count": len(results)}
 
     finally:
