@@ -1057,6 +1057,7 @@ def user_summary(user: Dict[str, Any]) -> Dict[str, Any]:
         "committed": committed,
         "email": user.get("email", ""),
         "email_verified": user.get("email_verified", False),
+        "email_verification_sent_at": user.get("email_verification_sent_at"),
     }
 
 

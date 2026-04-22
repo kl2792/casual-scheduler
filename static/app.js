@@ -2,6 +2,7 @@ const GPU_COUNT = 8;
 
 const state = {
   session: null,
+  emailEditing: false,
   overview: null,
   selectedWeek: null,
   selectedDay: null,
@@ -1048,26 +1049,63 @@ function renderPasswordChange() {
   `;
 }
 
+function emailResendSecondsLeft() {
+  const sentAt = state.session?.email_verification_sent_at;
+  if (!sentAt) return 0;
+  const elapsed = (Date.now() - new Date(sentAt).getTime()) / 1000;
+  return Math.max(0, Math.ceil(60 - elapsed));
+}
+
 function renderEmailSettings() {
   const email = state.session?.email || "";
   const verified = state.session?.email_verified || false;
-  const formHidden = email ? "display:none" : "";
-  const meta = email
-    ? `<a href="#" id="editEmailBtn" style="font-size:0.85em;color:#777;text-decoration:none">${verified ? "(edit)" : "(unverified) (edit)"}</a>`
-    : `<a href="#" id="editEmailBtn" style="font-size:0.85em">(edit)</a>`;
+  // state.emailEditing: true when user clicked (edit) from state 2 or 3
+  const editing = state.emailEditing || !email;
+
+  if (editing) {
+    // State 1 — address input
+    return `
+      <section class="sidebar-section">
+        <h2>Email Notifications</h2>
+        ${email ? `<p style="margin:0 0 6px;font-size:0.85em;color:#777"><a href="#" id="cancelEditEmailBtn">cancel</a></p>` : ""}
+        <form id="emailSettingsForm" style="display:flex;gap:8px;flex-direction:column">
+          <input type="email" name="email" placeholder="your@columbia.edu" value="${email}" />
+          <button type="submit">Set Email</button>
+        </form>
+        <p id="emailStatusMsg" style="font-size:0.8em;color:#888;margin:4px 0 0;display:none"></p>
+      </section>
+    `;
+  }
+
+  if (!verified) {
+    // State 2 — awaiting code
+    const secsLeft = emailResendSecondsLeft();
+    const resendLabel = secsLeft > 0
+      ? `Resend code <span id="emailCountdown">(${secsLeft}s)</span>`
+      : `<a href="#" id="resendCodeBtn">Resend code</a>`;
+    return `
+      <section class="sidebar-section">
+        <h2>Email Notifications</h2>
+        <p style="margin:0 0 6px">Email: <strong>${email}</strong><br>
+          <a href="#" id="editEmailBtn" style="font-size:0.85em;color:#777;text-decoration:none">(unverified) (edit)</a>
+        </p>
+        <form id="verifyCodeForm" style="display:flex;gap:8px;flex-direction:column">
+          <input type="text" name="code" placeholder="6-digit code" maxlength="6" inputmode="numeric" style="width:120px" autocomplete="one-time-code" />
+          <button type="submit">Verify</button>
+        </form>
+        <p style="font-size:0.8em;color:#888;margin:4px 0 0">${resendLabel}</p>
+        <p id="emailStatusMsg" style="font-size:0.8em;color:#888;margin:2px 0 0;display:none"></p>
+      </section>
+    `;
+  }
+
+  // State 3 — verified
   return `
     <section class="sidebar-section">
       <h2>Email Notifications</h2>
-      <p style="margin:0 0 6px">Email: <strong>${email || "(none)"}</strong><br>${meta}</p>
-      <form id="emailSettingsForm" style="display:flex;gap:8px;flex-direction:column;${formHidden}">
-        <input type="email" name="email" placeholder="your@columbia.edu" value="${email}" />
-        <button type="submit">Set Email</button>
-      </form>
-      ${email && !verified ? `
-      <form id="verifyCodeForm" style="display:flex;gap:8px;flex-direction:column;margin-top:8px">
-        <input type="text" name="code" placeholder="6-digit code" maxlength="6" inputmode="numeric" style="width:120px" />
-        <button type="submit">Verify</button>
-      </form>` : ""}
+      <p style="margin:0 0 6px">Email: <strong>${email}</strong><br>
+        <a href="#" id="editEmailBtn" style="font-size:0.85em;color:#777;text-decoration:none">(edit)</a>
+      </p>
       <p id="emailStatusMsg" style="font-size:0.8em;color:#888;margin:4px 0 0;display:none"></p>
     </section>
   `;
@@ -1298,17 +1336,23 @@ function bindInteractions() {
     }
   });
 
-  // Email settings — (edit) toggles form visibility
+  // Email — (edit) enters editing state
   document.getElementById("editEmailBtn")?.addEventListener("click", (ev) => {
     ev.preventDefault();
-    const form = document.getElementById("emailSettingsForm");
-    if (form) form.style.display = form.style.display === "none" ? "flex" : "none";
+    state.emailEditing = true;
+    render();
   });
 
+  document.getElementById("cancelEditEmailBtn")?.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    state.emailEditing = false;
+    render();
+  });
+
+  // Set Email form
   document.getElementById("emailSettingsForm")?.addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    const formData = new FormData(ev.target);
-    const email = formData.get("email").trim();
+    const email = new FormData(ev.target).get("email").trim();
     const statusEl = document.getElementById("emailStatusMsg");
     try {
       const resp = await fetchJson("/api/profile/email", {
@@ -1317,19 +1361,20 @@ function bindInteractions() {
       });
       const sessionResp = await fetchJson("/api/session");
       if (sessionResp.authenticated) state.session = sessionResp.user;
+      state.emailEditing = false;
       render();
-      // Show inline confirmation after re-render
-      const msg = document.getElementById("emailStatusMsg");
-      if (msg) { msg.textContent = resp.message || "Done."; msg.style.display = "block"; }
+      const m = document.getElementById("emailStatusMsg");
+      if (m) { m.textContent = resp.message || "Done."; m.style.display = "block"; }
     } catch (err) {
       if (statusEl) { statusEl.textContent = err.message; statusEl.style.display = "block"; }
     }
   });
 
+  // Verify code form
   document.getElementById("verifyCodeForm")?.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const code = new FormData(ev.target).get("code").trim();
-    const msg = document.getElementById("emailStatusMsg");
+    const statusEl = document.getElementById("emailStatusMsg");
     try {
       const resp = await fetchJson("/api/verify-email", {
         method: "POST",
@@ -1341,9 +1386,61 @@ function bindInteractions() {
       const m = document.getElementById("emailStatusMsg");
       if (m) { m.textContent = resp.message; m.style.display = "block"; }
     } catch (err) {
-      if (msg) { msg.textContent = err.message; msg.style.display = "block"; }
+      if (statusEl) { statusEl.textContent = err.message; statusEl.style.display = "block"; }
     }
   });
+
+  // Resend code (only rendered when cooldown elapsed)
+  document.getElementById("resendCodeBtn")?.addEventListener("click", async (ev) => {
+    ev.preventDefault();
+    const email = state.session?.email || "";
+    const statusEl = document.getElementById("emailStatusMsg");
+    try {
+      const resp = await fetchJson("/api/profile/email", {
+        method: "POST",
+        body: JSON.stringify({ email }),
+      });
+      const sessionResp = await fetchJson("/api/session");
+      if (sessionResp.authenticated) state.session = sessionResp.user;
+      render();
+      const m = document.getElementById("emailStatusMsg");
+      if (m) { m.textContent = resp.message; m.style.display = "block"; }
+    } catch (err) {
+      if (statusEl) { statusEl.textContent = err.message; statusEl.style.display = "block"; }
+    }
+  });
+
+  // Live countdown for resend cooldown
+  if (document.getElementById("emailCountdown")) {
+    const countdownInterval = setInterval(() => {
+      const el = document.getElementById("emailCountdown");
+      if (!el) { clearInterval(countdownInterval); return; }
+      const secs = emailResendSecondsLeft();
+      if (secs <= 0) {
+        clearInterval(countdownInterval);
+        // Replace the static text with a clickable link
+        const p = el.closest("p");
+        if (p) { p.innerHTML = `<a href="#" id="resendCodeBtn">Resend code</a>`; }
+        document.getElementById("resendCodeBtn")?.addEventListener("click", async (ev) => {
+          ev.preventDefault();
+          const email = state.session?.email || "";
+          try {
+            const resp = await fetchJson("/api/profile/email", { method: "POST", body: JSON.stringify({ email }) });
+            const sessionResp = await fetchJson("/api/session");
+            if (sessionResp.authenticated) state.session = sessionResp.user;
+            render();
+            const m = document.getElementById("emailStatusMsg");
+            if (m) { m.textContent = resp.message; m.style.display = "block"; }
+          } catch (err) {
+            const statusEl = document.getElementById("emailStatusMsg");
+            if (statusEl) { statusEl.textContent = err.message; statusEl.style.display = "block"; }
+          }
+        });
+      } else {
+        el.textContent = `(${secs}s)`;
+      }
+    }, 1000);
+  }
 
   // Setup bulk selection feature
   setupBulkSelection();
