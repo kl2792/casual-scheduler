@@ -54,6 +54,7 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)  # defaults to SMTP_USER
+SMTP_TIMEOUT = int(os.environ.get("SMTP_TIMEOUT", "10"))  # seconds
 
 # ==============================================================================
 # GLOBAL STATE
@@ -956,13 +957,13 @@ def send_outbid_email(to_address: str, username: str, slot_ids: List[str]) -> No
         f"Log in to place a new bid before the week closes.\n"
     )
 
-    msg = MIMEText(body)
+    msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = f"GPU Scheduler: you've been outbid on {len(slot_ids)} slot(s)"
     msg["From"] = SMTP_FROM
     msg["To"] = to_address
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
             smtp.ehlo()
             smtp.starttls()
             smtp.ehlo()
@@ -973,21 +974,17 @@ def send_outbid_email(to_address: str, username: str, slot_ids: List[str]) -> No
         print(f"EMAIL ERROR: failed to send outbid email to {to_address}: {exc}")
 
 
-def _fire_outbid_emails(outbid_map: Dict[str, List[str]]) -> None:
+def _fire_outbid_emails(email_map: Dict[str, Tuple[str, List[str]]]) -> None:
     """Send one email per affected user summarising all slots lost in one bid event.
 
-    outbid_map: {username: [slot_id, ...]}
+    email_map: {username: (email_address, [slot_id, ...])}
+    All values must be captured inside state_lock before calling this.
     Runs in a daemon thread — never blocks the request path.
     """
     def _send() -> None:
-        for username, slot_ids in outbid_map.items():
-            user = state.get("users", {}).get(username)
-            if not user:
-                continue
-            email = user.get("email", "")
-            if not email:
-                continue
-            send_outbid_email(email, username, slot_ids)
+        for username, (email, slot_ids) in email_map.items():
+            if email:
+                send_outbid_email(email, username, slot_ids)
 
     t = threading.Thread(target=_send, daemon=True)
     t.start()
@@ -1154,7 +1151,8 @@ def place_bid(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
 
             # Add outbid notification for all users who were outbid
             slot_id = f"{week_key}|{slot_key}|{gpu_index}"
-            email_map: Dict[str, List[str]] = {}
+            # Snapshot emails inside the lock so the background thread never reads state directly
+            email_map: Dict[str, Tuple[str, List[str]]] = {}
             for outbid_username in outbid_users:
                 outbid_user = state.get("users", {}).get(outbid_username)
                 if outbid_user:
@@ -1163,9 +1161,11 @@ def place_bid(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
                     if slot_id not in outbid_user["outbid_notification_queue"]:
                         outbid_user["outbid_notification_queue"].append(slot_id)
                         print(f"ADDED TO QUEUE: {slot_id} for user {outbid_username}")
-                    email_map.setdefault(outbid_username, []).append(slot_id)
-            if email_map:
-                _fire_outbid_emails(email_map)
+                        email = outbid_user.get("email", "")
+                        if outbid_username in email_map:
+                            email_map[outbid_username][1].append(slot_id)
+                        else:
+                            email_map[outbid_username] = (email, [slot_id])
 
             state["bid_log"].append(
                 {
@@ -1182,6 +1182,8 @@ def place_bid(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
                 state["bid_log"] = state["bid_log"][-500:]
 
             save_state()
+            if email_map:
+                _fire_outbid_emails(email_map)
             return {"ok": True, "price": new_price, "winner": user["username"]}
 
 
@@ -1304,7 +1306,8 @@ def place_bulk_bids(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, 
             timestamp = now_et().isoformat()
             results = []
 
-            bulk_email_map: Dict[str, List[str]] = {}
+            # Snapshot emails inside the lock so the background thread never reads state directly
+            bulk_email_map: Dict[str, Tuple[str, List[str]]] = {}
             for v in validations:
                 entry = v["entry"]
 
@@ -1335,7 +1338,11 @@ def place_bulk_bids(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, 
                         if slot_id not in outbid_user["outbid_notification_queue"]:
                             outbid_user["outbid_notification_queue"].append(slot_id)
                             print(f"ADDED TO QUEUE: {slot_id} for user {outbid_username}")
-                        bulk_email_map.setdefault(outbid_username, []).append(slot_id)
+                            email = outbid_user.get("email", "")
+                            if outbid_username in bulk_email_map:
+                                bulk_email_map[outbid_username][1].append(slot_id)
+                            else:
+                                bulk_email_map[outbid_username] = (email, [slot_id])
 
                 state["bid_log"].append(
                     {
@@ -1655,7 +1662,12 @@ def update_user(payload: Dict[str, Any]) -> Dict[str, Any]:
         user["enabled"] = bool(payload["enabled"])
 
     if "email" in payload:
-        user["email"] = str(payload.get("email") or "").strip()
+        email = str(payload.get("email") or "").strip()
+        # Strip control characters that could enable header injection
+        email = "".join(c for c in email if c not in "\r\n")
+        if email and "@" not in email:
+            return {"error": "Invalid email address."}
+        user["email"] = email
 
     save_state()
     return {"ok": True, "user": user_summary(user)}
@@ -1706,7 +1718,11 @@ def create_user(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": str(exc)}
 
     if "email" in payload:
-        user["email"] = str(payload.get("email") or "").strip()
+        email = str(payload.get("email") or "").strip()
+        email = "".join(c for c in email if c not in "\r\n")
+        if email and "@" not in email:
+            return {"error": "Invalid email address."}
+        user["email"] = email
         save_state()
 
     return {"ok": True, "user": user_summary(user)}

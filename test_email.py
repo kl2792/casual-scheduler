@@ -131,8 +131,8 @@ class TestFireOutbidEmails(unittest.TestCase):
              patch.object(self.app, "send_outbid_email", side_effect=fake_send):
             t_before = threading.active_count()
             self.app._fire_outbid_emails({
-                "alice": ["w|s|0", "w|s|1"],
-                "bob": ["w|s|2"],
+                "alice": ("alice@columbia.edu", ["w|s|0", "w|s|1"]),
+                "bob": ("bob@columbia.edu", ["w|s|2"]),
             })
             # Give the daemon thread time to finish
             import time; time.sleep(0.1)
@@ -155,7 +155,10 @@ class TestFireOutbidEmails(unittest.TestCase):
 
         with patch.object(self.app, "state", fake_state), \
              patch.object(self.app, "send_outbid_email", side_effect=lambda *a: sent.append(a)):
-            self.app._fire_outbid_emails({"alice": ["w|s|0"], "bob": ["w|s|1"]})
+            self.app._fire_outbid_emails({
+                "alice": ("", ["w|s|0"]),
+                "bob": ("bob@columbia.edu", ["w|s|1"]),
+            })
             import time; time.sleep(0.1)
 
         self.assertEqual(len(sent), 1)
@@ -167,7 +170,8 @@ class TestFireOutbidEmails(unittest.TestCase):
 
         with patch.object(self.app, "state", fake_state), \
              patch.object(self.app, "send_outbid_email", side_effect=lambda *a: sent.append(a)):
-            self.app._fire_outbid_emails({"ghost": ["w|s|0"]})
+            # email_map has pre-resolved addresses; empty email means no send
+            self.app._fire_outbid_emails({"ghost": ("", ["w|s|0"])})
             import time; time.sleep(0.1)
 
         self.assertEqual(sent, [])
