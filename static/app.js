@@ -1051,21 +1051,19 @@ function renderPasswordChange() {
 function renderEmailSettings() {
   const email = state.session?.email || "";
   const verified = state.session?.email_verified || false;
-  const statusSuffix = email
-    ? (verified ? "" : " (unverified)")
-    : "";
-  const emailDisplay = email ? `${email}${statusSuffix}` : "(none)";
-  // Form is hidden when email already set; revealed by clicking (edit)
   const formHidden = email ? "display:none" : "";
+  const meta = email
+    ? `<span style="font-size:0.85em;color:#777">${verified ? "" : "(unverified) "}<a href="#" id="editEmailBtn">(edit)</a></span>`
+    : `<a href="#" id="editEmailBtn" style="font-size:0.85em">(edit)</a>`;
   return `
     <section class="sidebar-section">
       <h2>Email Notifications</h2>
-      <p style="margin:0 0 8px">Email: <strong>${emailDisplay}</strong>${email ? ' <a href="#" id="editEmailBtn" style="font-size:0.85em">(edit)</a>' : ""}</p>
+      <p style="margin:0 0 6px">Email: <strong>${email || "(none)"}</strong><br>${meta}</p>
       <form id="emailSettingsForm" style="display:flex;gap:8px;flex-direction:column;${formHidden}">
         <input type="email" name="email" placeholder="your@columbia.edu" value="${email}" />
         <button type="submit">Set Email</button>
-        ${email && !verified ? `<button type="button" id="resendVerifyBtn" style="background:none;border:none;padding:0;color:#0066cc;cursor:pointer;text-align:left;font-size:0.85em">Resend verification email</button>` : ""}
       </form>
+      <p id="emailStatusMsg" style="font-size:0.8em;color:#888;margin:4px 0 0;display:none"></p>
     </section>
   `;
 }
@@ -1306,29 +1304,20 @@ function bindInteractions() {
     ev.preventDefault();
     const formData = new FormData(ev.target);
     const email = formData.get("email").trim();
+    const statusEl = document.getElementById("emailStatusMsg");
     try {
       const resp = await fetchJson("/api/profile/email", {
         method: "POST",
         body: JSON.stringify({ email }),
       });
-      alert(resp.message || "Done.");
       const sessionResp = await fetchJson("/api/session");
       if (sessionResp.authenticated) state.session = sessionResp.user;
       render();
+      // Show inline confirmation after re-render
+      const msg = document.getElementById("emailStatusMsg");
+      if (msg) { msg.textContent = resp.message || "Done."; msg.style.display = "block"; }
     } catch (err) {
-      alert(err.message);
-    }
-  });
-
-  document.getElementById("resendVerifyBtn")?.addEventListener("click", async () => {
-    try {
-      const resp = await fetchJson("/api/profile/email", {
-        method: "POST",
-        body: JSON.stringify({ email: state.session?.email || "" }),
-      });
-      alert(resp.message || "Verification email sent.");
-    } catch (err) {
-      alert(err.message);
+      if (statusEl) { statusEl.textContent = err.message; statusEl.style.display = "block"; }
     }
   });
 
