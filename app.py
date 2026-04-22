@@ -55,6 +55,7 @@ SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USER)  # defaults to SMTP_USER
 SMTP_TIMEOUT = int(os.environ.get("SMTP_TIMEOUT", "10"))  # seconds
+APP_URL = os.environ.get("APP_URL", "").rstrip("/")  # e.g. https://casualai.net
 
 # ==============================================================================
 # GLOBAL STATE
@@ -931,6 +932,38 @@ def finalize_past_gpu_slots() -> int:
 # EMAIL NOTIFICATIONS
 # ==============================================================================
 
+def _smtp_send(to_address: str, subject: str, body: str) -> None:
+    """Low-level SMTP send. Raises on failure — callers handle exceptions."""
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_address
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.ehlo()
+        if SMTP_USER and SMTP_PASS:
+            smtp.login(SMTP_USER, SMTP_PASS)
+        smtp.sendmail(SMTP_FROM, [to_address], msg.as_string())
+
+
+def send_verification_email(to_address: str, username: str, token: str) -> None:
+    """Send an email-verification link. No-ops if SMTP_HOST is not configured."""
+    if not SMTP_HOST or not to_address:
+        return
+    verify_url = f"{APP_URL}/api/verify-email?token={token}" if APP_URL else f"/api/verify-email?token={token}"
+    body = (
+        f"Hi {username},\n\n"
+        f"Please verify your email address to receive GPU scheduler notifications:\n\n"
+        f"  {verify_url}\n\n"
+        f"If you did not expect this, you can ignore it.\n"
+    )
+    try:
+        _smtp_send(to_address, "GPU Scheduler: verify your email address", body)
+    except Exception as exc:
+        print(f"EMAIL ERROR: failed to send verification email to {to_address}: {exc}")
+
+
 def send_outbid_email(to_address: str, username: str, slot_ids: List[str]) -> None:
     """Send an outbid notification email.
 
@@ -945,31 +978,21 @@ def send_outbid_email(to_address: str, username: str, slot_ids: List[str]) -> No
         parts = slot_id.split("|")
         if len(parts) == 3:
             week_key, slot_key, gpu_index = parts
-            slot_lines.append(f"  • GPU {gpu_index}  —  {slot_key}")
+            slot_lines.append(f"  - GPU {gpu_index}  {slot_key}")
         else:
-            slot_lines.append(f"  • {slot_id}")
+            slot_lines.append(f"  - {slot_id}")
 
     slots_text = "\n".join(slot_lines)
+    login_line = f"Log in at {APP_URL} to place a new bid before the week closes." if APP_URL else "Log in to place a new bid before the week closes."
     body = (
         f"Hi {username},\n\n"
         f"You were outbid on the following GPU slot(s):\n\n"
         f"{slots_text}\n\n"
-        f"Log in to place a new bid before the week closes.\n"
+        f"{login_line}\n"
     )
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = f"GPU Scheduler: you've been outbid on {len(slot_ids)} slot(s)"
-    msg["From"] = SMTP_FROM
-    msg["To"] = to_address
-
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as smtp:
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.ehlo()
-            if SMTP_USER and SMTP_PASS:
-                smtp.login(SMTP_USER, SMTP_PASS)
-            smtp.sendmail(SMTP_FROM, [to_address], msg.as_string())
+        _smtp_send(to_address, f"GPU Scheduler: you've been outbid on {len(slot_ids)} slot(s)", body)
     except Exception as exc:
         print(f"EMAIL ERROR: failed to send outbid email to {to_address}: {exc}")
 
@@ -979,6 +1002,7 @@ def _fire_outbid_emails(email_map: Dict[str, Tuple[str, List[str]]]) -> None:
 
     email_map: {username: (email_address, [slot_id, ...])}
     All values must be captured inside state_lock before calling this.
+    Only sends to users whose email is verified.
     Runs in a daemon thread — never blocks the request path.
     """
     def _send() -> None:
@@ -1005,6 +1029,8 @@ def user_summary(user: Dict[str, Any]) -> Dict[str, Any]:
         "weekly_budget": user["weekly_budget"],
         "rollover_applied": user.get("rollover_applied", 0),
         "committed": committed,
+        "email": user.get("email", ""),
+        "email_verified": user.get("email_verified", False),
     }
 
 
@@ -1057,6 +1083,8 @@ def create_user_account(
         "enabled": True,
         "last_login": None,
         "email": "",
+        "email_verified": False,
+        "email_verification_token": "",
     }
 
     state["users"][username] = user
@@ -1161,11 +1189,13 @@ def place_bid(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
                     if slot_id not in outbid_user["outbid_notification_queue"]:
                         outbid_user["outbid_notification_queue"].append(slot_id)
                         print(f"ADDED TO QUEUE: {slot_id} for user {outbid_username}")
-                        email = outbid_user.get("email", "")
-                        if outbid_username in email_map:
-                            email_map[outbid_username][1].append(slot_id)
-                        else:
-                            email_map[outbid_username] = (email, [slot_id])
+                        # Only snapshot verified emails
+                        if outbid_user.get("email_verified") and outbid_user.get("email"):
+                            email = outbid_user["email"]
+                            if outbid_username in email_map:
+                                email_map[outbid_username][1].append(slot_id)
+                            else:
+                                email_map[outbid_username] = (email, [slot_id])
 
             state["bid_log"].append(
                 {
@@ -1338,11 +1368,13 @@ def place_bulk_bids(user: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, 
                         if slot_id not in outbid_user["outbid_notification_queue"]:
                             outbid_user["outbid_notification_queue"].append(slot_id)
                             print(f"ADDED TO QUEUE: {slot_id} for user {outbid_username}")
-                            email = outbid_user.get("email", "")
-                            if outbid_username in bulk_email_map:
-                                bulk_email_map[outbid_username][1].append(slot_id)
-                            else:
-                                bulk_email_map[outbid_username] = (email, [slot_id])
+                            # Only snapshot verified emails
+                            if outbid_user.get("email_verified") and outbid_user.get("email"):
+                                email = outbid_user["email"]
+                                if outbid_username in bulk_email_map:
+                                    bulk_email_map[outbid_username][1].append(slot_id)
+                                else:
+                                    bulk_email_map[outbid_username] = (email, [slot_id])
 
                 state["bid_log"].append(
                     {
@@ -1661,15 +1693,36 @@ def update_user(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "enabled" in payload:
         user["enabled"] = bool(payload["enabled"])
 
+    send_verification = False
+    verification_token = ""
+    verification_email = ""
     if "email" in payload:
         email = str(payload.get("email") or "").strip()
         # Strip control characters that could enable header injection
         email = "".join(c for c in email if c not in "\r\n")
         if email and "@" not in email:
             return {"error": "Invalid email address."}
-        user["email"] = email
+        if email != user.get("email", ""):
+            # New address — reset verification and generate a fresh token
+            token = secrets.token_urlsafe(32)
+            user["email"] = email
+            user["email_verified"] = False
+            user["email_verification_token"] = token
+            if email:
+                send_verification = True
+                verification_token = token
+                verification_email = email
 
     save_state()
+
+    if send_verification:
+        # Send outside the state_lock context (caller releases lock after return)
+        threading.Thread(
+            target=send_verification_email,
+            args=(verification_email, username, verification_token),
+            daemon=True,
+        ).start()
+
     return {"ok": True, "user": user_summary(user)}
 
 
@@ -2765,6 +2818,21 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
+        if route == "/api/verify-email":
+            token = params.get("token", [""])[0]
+            if not token:
+                self.send_json({"error": "Missing token."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            for user in state.get("users", {}).values():
+                if user.get("email_verification_token") == token and user.get("email"):
+                    user["email_verified"] = True
+                    user["email_verification_token"] = ""
+                    save_state()
+                    self.send_json({"ok": True, "message": "Email verified. You will receive outbid notifications."})
+                    return
+            self.send_json({"error": "Invalid or expired token."}, status=HTTPStatus.BAD_REQUEST)
+            return
+
         self.send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 
     def handle_api_post(self, payload: Dict[str, Any]) -> None:
@@ -3023,6 +3091,63 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             response = clear_week_bids(payload)
             status = HTTPStatus.OK if response.get("ok") else HTTPStatus.BAD_REQUEST
             self.send_json(response, status=status)
+            return
+
+        if route == "/api/profile/email":
+            # Self-service: any authenticated user can set their own email.
+            if not current_user:
+                self.send_json({"error": "Authentication required."}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            email = str(payload.get("email") or "").strip()
+            email = "".join(c for c in email if c not in "\r\n")
+            if email and "@" not in email:
+                self.send_json({"error": "Invalid email address."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            username = current_user["username"]
+            user = state["users"][username]
+            if email != user.get("email", ""):
+                token = secrets.token_urlsafe(32)
+                user["email"] = email
+                user["email_verified"] = False
+                user["email_verification_token"] = token
+                save_state()
+                if email:
+                    threading.Thread(
+                        target=send_verification_email,
+                        args=(email, username, token),
+                        daemon=True,
+                    ).start()
+                    self.send_json({"ok": True, "message": "Verification email sent. Check your inbox."})
+                else:
+                    self.send_json({"ok": True, "message": "Email removed."})
+            else:
+                self.send_json({"ok": True, "message": "No change."})
+            return
+
+        if route == "/api/admin/test-email":
+            if not current_user or current_user["role"] != "admin":
+                self.send_json({"error": "Admin privileges required."}, status=HTTPStatus.FORBIDDEN)
+                return
+            username = payload.get("username")
+            if not username:
+                self.send_json({"error": "username required."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            target = state.get("users", {}).get(username)
+            if not target:
+                self.send_json({"error": "User not found."}, status=HTTPStatus.NOT_FOUND)
+                return
+            email = target.get("email", "")
+            if not email:
+                self.send_json({"error": "User has no email address set."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if not SMTP_HOST:
+                self.send_json({"error": "SMTP_HOST is not configured."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                _smtp_send(email, "GPU Scheduler: test email", f"Hi {username},\n\nThis is a test email from the GPU Scheduler. SMTP is configured correctly.\n")
+                self.send_json({"ok": True, "message": f"Test email sent to {email}."})
+            except Exception as exc:
+                self.send_json({"error": f"SMTP error: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         self.send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)

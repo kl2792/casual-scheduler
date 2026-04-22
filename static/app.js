@@ -1044,6 +1044,26 @@ function renderPasswordChange() {
         <button type="submit">Change Password</button>
       </form>
     </section>
+    ${renderEmailSettings()}
+  `;
+}
+
+function renderEmailSettings() {
+  const email = state.session?.email || "";
+  const verified = state.session?.email_verified || false;
+  const statusLabel = email
+    ? (verified ? " <span style='color:#2a9d2a'>(verified)</span>" : " <span style='color:#c07000'>(unverified — check your inbox)</span>")
+    : "";
+  return `
+    <section class="sidebar-section">
+      <h2>Email Notifications</h2>
+      <p style="font-size:0.85em;color:#555;margin:0 0 8px">Receive an email when you are outbid. Your email must be verified before notifications are sent.</p>
+      <form id="emailSettingsForm" style="display: flex; gap: 8px; flex-direction: column;">
+        <input type="email" name="email" placeholder="your@columbia.edu" value="${email}" />
+        <button type="submit">${email ? "Update Email" : "Set Email"}</button>
+      </form>
+      ${email ? `<p style="font-size:0.8em;margin:4px 0 0">Current: <strong>${email}</strong>${statusLabel}</p>` : ""}
+    </section>
   `;
 }
 
@@ -1267,6 +1287,26 @@ function bindInteractions() {
         body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
       });
       alert("Password changed successfully.");
+    } catch (err) {
+      alert(err.message);
+    }
+  });
+
+  // Email settings
+  document.getElementById("emailSettingsForm")?.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const formData = new FormData(ev.target);
+    const email = formData.get("email").trim();
+    try {
+      const resp = await fetchJson("/api/profile/email", {
+        method: "POST",
+        body: JSON.stringify({ email }),
+      });
+      alert(resp.message || "Done.");
+      // Refresh session so email/verified status updates
+      const sessionResp = await fetchJson("/api/session");
+      if (sessionResp.authenticated) state.session = sessionResp.user;
+      render();
     } catch (err) {
       alert(err.message);
     }
