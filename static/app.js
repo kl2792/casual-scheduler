@@ -1058,18 +1058,19 @@ function emailResendSecondsLeft() {
 
 function renderEmailSettings() {
   const email = state.session?.email || "";
+  const emailPending = state.session?.email_pending || "";
   const verified = state.session?.email_verified || false;
   // state.emailEditing: true when user clicked (edit) from state 2 or 3
-  const editing = state.emailEditing || !email;
+  const editing = state.emailEditing || (!email && !emailPending);
 
   if (editing) {
     // State 1 — address input
     return `
       <section class="sidebar-section">
         <h2>Email Notifications</h2>
-        ${email ? `<p style="margin:0 0 6px;font-size:0.85em;color:#777"><a href="#" id="cancelEditEmailBtn">cancel</a></p>` : ""}
+        ${(email || emailPending) ? `<p style="margin:0 0 6px;font-size:0.85em;color:#777"><a href="#" id="cancelEditEmailBtn">cancel</a></p>` : ""}
         <form id="emailSettingsForm" style="display:flex;gap:8px;flex-direction:column">
-          <input type="email" name="email" placeholder="your@columbia.edu" value="${email}" />
+          <input type="email" name="email" placeholder="your@columbia.edu" value="${email || emailPending}" />
           <button type="submit">Set Email</button>
         </form>
         <p id="emailStatusMsg" style="font-size:0.8em;color:#888;margin:4px 0 0;display:none"></p>
@@ -1086,7 +1087,7 @@ function renderEmailSettings() {
     return `
       <section class="sidebar-section">
         <h2>Email Notifications</h2>
-        <p style="margin:0 0 6px">Email: <strong>${email}</strong><br>
+        <p style="margin:0 0 6px">Email: <strong>${emailPending}</strong><br>
           <a href="#" id="editEmailBtn" style="font-size:0.85em;color:#777;text-decoration:none">(unverified) (edit)</a>
         </p>
         <form id="verifyCodeForm" style="display:flex;gap:8px;flex-direction:column">
@@ -1393,7 +1394,7 @@ function bindInteractions() {
   // Resend code (only rendered when cooldown elapsed)
   document.getElementById("resendCodeBtn")?.addEventListener("click", async (ev) => {
     ev.preventDefault();
-    const email = state.session?.email || "";
+    const email = state.session?.email_pending || state.session?.email || "";
     const statusEl = document.getElementById("emailStatusMsg");
     try {
       const resp = await fetchJson("/api/profile/email", {

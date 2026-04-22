@@ -947,6 +947,7 @@ def _maybe_send_verification(user: Dict[str, Any], email: str) -> Optional[str]:
             return f"Please wait {remaining}s before requesting another verification email."
 
     code = f"{secrets.randbelow(1_000_000):06d}"
+    user["email_pending"] = email
     user["email_verification_token"] = code
     user["email_verification_sent_at"] = now_et().isoformat()
 
@@ -1056,6 +1057,7 @@ def user_summary(user: Dict[str, Any]) -> Dict[str, Any]:
         "rollover_applied": user.get("rollover_applied", 0),
         "committed": committed,
         "email": user.get("email", ""),
+        "email_pending": user.get("email_pending", ""),
         "email_verified": user.get("email_verified", False),
         "email_verification_sent_at": user.get("email_verification_sent_at"),
     }
@@ -1109,7 +1111,8 @@ def create_user_account(
         "last_refill_week": None,
         "enabled": True,
         "last_login": None,
-        "email": "",
+        "email": "",           # verified address — used for notifications
+        "email_pending": "",   # address awaiting verification code
         "email_verified": False,
         "email_verification_token": "",
         "email_verification_sent_at": None,
@@ -1726,13 +1729,14 @@ def update_user(payload: Dict[str, Any]) -> Dict[str, Any]:
         email = "".join(c for c in email if c not in "\r\n")
         if email and "@" not in email:
             return {"error": "Invalid email address."}
-        if email != user.get("email", ""):
-            user["email"] = email
+        if not email:
+            user["email"] = ""
+            user["email_pending"] = ""
             user["email_verified"] = False
             user["email_verification_token"] = ""
             user["email_verification_sent_at"] = None
-            if email:
-                _maybe_send_verification(user, email)
+        else:
+            _maybe_send_verification(user, email)
 
     save_state()
     return {"ok": True, "user": user_summary(user)}
@@ -3100,11 +3104,16 @@ class SchedulerHandler(BaseHTTPRequestHandler):
                 return
             user = state["users"][current_user["username"]]
             stored = user.get("email_verification_token", "")
-            if not stored or code != stored:
+            pending = user.get("email_pending", "")
+            if not stored or code != stored or not pending:
                 self.send_json({"error": "Invalid code."}, status=HTTPStatus.BAD_REQUEST)
                 return
+            # Promote pending → verified
+            user["email"] = pending
+            user["email_pending"] = ""
             user["email_verified"] = True
             user["email_verification_token"] = ""
+            user["email_verification_sent_at"] = None
             save_state()
             self.send_json({"ok": True, "message": "Email verified. You'll receive outbid notifications."})
             return
@@ -3123,30 +3132,20 @@ class SchedulerHandler(BaseHTTPRequestHandler):
             user = state["users"][username]
             if not email:
                 user["email"] = ""
+                user["email_pending"] = ""
                 user["email_verified"] = False
                 user["email_verification_token"] = ""
                 user["email_verification_sent_at"] = None
                 save_state()
                 self.send_json({"ok": True, "message": "Email removed."})
-            elif email != user.get("email", ""):
-                user["email"] = email
-                user["email_verified"] = False
-                user["email_verification_token"] = ""
-                user["email_verification_sent_at"] = None
+            else:
+                # New or resend — _maybe_send_verification sets email_pending, token, sent_at
                 err = _maybe_send_verification(user, email)
                 save_state()
                 if err:
                     self.send_json({"error": err}, status=HTTPStatus.TOO_MANY_REQUESTS)
                 else:
-                    self.send_json({"ok": True, "message": "Verification email sent. Check your inbox."})
-            else:
-                # Same address — resend if cooldown elapsed
-                err = _maybe_send_verification(user, email)
-                if err:
-                    self.send_json({"error": err}, status=HTTPStatus.TOO_MANY_REQUESTS)
-                else:
-                    save_state()
-                    self.send_json({"ok": True, "message": "Verification email resent. Check your inbox."})
+                    self.send_json({"ok": True, "message": "Verification code sent. Check your inbox."})
             return
 
         if route == "/api/admin/test-email":
